@@ -1,0 +1,25 @@
+[package]
+name = "opus_parvulum"
+version = "0.1.0"
+authors = ["astra137 <maccelerated@gmail.com>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vst3-sys = { git = "https://github.com/astra137/vst3-sys", branch = "dev" }
+vst3-com = { git = "https://github.com/astra137/vst3-sys", branch = "dev" }
+audiopus = "0.2"
+simple_logger = "1.11"
+log = "0.4"
+flexi_logger = "0.17"
+widestring = "0.4"
+hex-literal = "0.3"
+enum-map = "1.1"
+num_enum = "0.5"
+dasp = { version = "0.11", features = ["all"] }
+anyhow = "1.0"
+samplerate = "0.2"
+ringbuf = "0.2"
+itertools = "0.10"
