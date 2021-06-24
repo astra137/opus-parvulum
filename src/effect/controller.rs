@@ -1,18 +1,22 @@
 use super::params::Parameter;
-use super::params::ParameterFrom;
+use super::params::Unit;
 use super::ContextPtr;
-use super::SaveState;
+use super::VstClassInfo;
+use crate::vst_result;
 use crate::vst_str;
-use crate::Component;
 use enum_map::EnumMap;
 use hex_literal::hex;
 use log::*;
+use num_enum::TryFromPrimitive;
 use std::cell::RefCell;
+use std::convert::TryInto;
 use std::mem::size_of;
 use std::os::raw::c_void;
 use std::ptr::null_mut;
 use vst3_com::sys::GUID;
 use vst3_com::ComPtr;
+use vst3_com::IID;
+use vst3_sys::base::kInternalError;
 use vst3_sys::base::kInvalidArgument;
 use vst3_sys::base::{
 	kResultFalse, kResultOk, kResultTrue, tresult, ClassCardinality, FIDString, IBStream,
@@ -34,19 +38,20 @@ pub struct OpusController {
 	parameters: RefCell<EnumMap<Parameter, f64>>,
 }
 
-impl Component for OpusController {
-	const CID: GUID = GUID {
-		data: hex!("6aa2e096dae547c5ba690605fd776699"),
+impl OpusController {
+	pub const CID: IID = GUID {
+		data: hex!("2b2d7388e6ee950c8cc3ed7c887f2a96"),
 	};
 
-	const CARDINALITY: i32 = ClassCardinality::kManyInstances as i32;
-	const CATEGORY: &'static str = "Component Controller Class";
-	const NAME: &'static str = "Opus Parvulum Controller";
-	const CLASS_FLAGS: u32 = 0;
-	const SUBCATEGORIES: &'static str = "";
-}
+	pub const INFO: VstClassInfo = VstClassInfo {
+		cid: Self::CID,
+		name: "Opus Parvulum Controller",
+		category: "Component Controller Class",
+		subcategories: "",
+		class_flags: 0,
+		cardinality: ClassCardinality::kManyInstances as i32,
+	};
 
-impl OpusController {
 	pub fn new() -> Box<Self> {
 		let context = RefCell::new(ContextPtr(null_mut()));
 		let component_handler = RefCell::new(ComponentHandler(null_mut()));
@@ -56,10 +61,6 @@ impl OpusController {
 
 	pub fn create_instance() -> *mut c_void {
 		Box::into_raw(Self::new()) as *mut c_void
-	}
-
-	fn nth_parameter(&self, id: usize) -> Option<Parameter> {
-		Some(self.parameters.borrow().iter().nth(id as usize)?.0)
 	}
 }
 
@@ -71,30 +72,18 @@ impl IEditController for OpusController {
 			return kResultFalse;
 		}
 
+		let mut params = vst_result!(self.parameters.try_borrow_mut());
+
 		let state = state as *mut *mut _;
 		let state: ComPtr<dyn IBStream> = ComPtr::new(state);
-
-		let mut save_state = SaveState::new();
-
 		let mut num_bytes_read = 0;
-		let saved_params_ptr = &mut save_state as *mut SaveState as *mut c_void;
-		state.read(
-			saved_params_ptr,
-			size_of::<SaveState>() as i32,
-			&mut num_bytes_read,
-		);
 
-		self.parameters
-			.borrow_mut()
-			.iter_mut()
-			.for_each(|(param, val)| match param {
-				Parameter::Bypass => val.from_bool(save_state.bypass),
-				Parameter::InbandFec => val.from_bool(save_state.inband_fec),
-				Parameter::PredictedLoss => val.from_percentage(save_state.packet_loss_perc),
-				Parameter::Complexity => val.from_complexity(save_state.complexity),
-				Parameter::Gain => val.from_gain(save_state.gain),
-				Parameter::MaxBandwith => val.from_bandwidth(save_state.max_bandwidth),
-			});
+		for (_param, val) in params.iter_mut() {
+			let mut num = 0.0;
+			let ptr = &mut num as *mut f64 as *mut c_void;
+			state.read(ptr, size_of::<f64>() as i32, &mut num_bytes_read);
+			*val = num;
+		}
 
 		kResultOk
 	}
@@ -111,35 +100,41 @@ impl IEditController for OpusController {
 
 	unsafe fn get_parameter_count(&self) -> i32 {
 		info!("get_parameter_count()");
-		self.parameters.borrow().len() as i32
+		Parameter::VARIANT_COUNT.try_into().unwrap()
 	}
 
 	unsafe fn get_parameter_info(&self, id: i32, info: *mut ParameterInfo) -> tresult {
-		if let Some(param) = self.nth_parameter(id as usize) {
-			info!("get_parameter_info({}) => {:?}", id, param);
-			*info = param.get_parameter_info();
-			kResultTrue
-		} else {
-			error!("get_parameter_info({}) no such param", id);
-			kResultFalse
+		match Parameter::try_from_primitive(id as u32) {
+			Ok(param) => {
+				*info = param.get_parameter_info();
+				kResultTrue
+			}
+			Err(err) => {
+				error!("get_parameter_info({}) {}", id, err);
+				kInvalidArgument
+			}
 		}
 	}
 
 	unsafe fn get_param_string_by_value(&self, id: u32, value: f64, string: *mut TChar) -> tresult {
-		info!("get_param_string_by_value({},{:.2})", id, value);
-
 		// Borrow pointer as String128, because that's the actual type in the SDK
 		let string = &mut *(string as *mut String128);
 
-		match self.nth_parameter(id as usize) {
-			Some(param) => match param.get_param_string_by_value(value) {
-				Some(new_string) => {
-					*string = vst_str::str_16(&new_string);
-					kResultTrue
+		match Parameter::try_from_primitive(id) {
+			Ok(param) => {
+				//
+				match param.get_param_string_by_value(value) {
+					Some(new_string) => {
+						*string = vst_str::str_16(&new_string);
+						kResultTrue
+					}
+					None => kResultFalse,
 				}
-				None => kResultFalse,
-			},
-			None => kInvalidArgument,
+			}
+			Err(err) => {
+				error!("get_param_string_by_value({}) {}", id, err);
+				kInvalidArgument
+			}
 		}
 	}
 
@@ -153,51 +148,70 @@ impl IEditController for OpusController {
 		// to isolate the rest of the codebase from FFI and unsafe code
 		let string = vst_str::wcstr_to_str(ptr);
 
-		info!("get_param_value_by_string({}, {})", id, string);
-
-		match self.nth_parameter(id as usize) {
-			Some(param) => match param.get_param_value_by_string(&string) {
-				Some(new_value) => {
-					*value = new_value;
-					kResultTrue
+		match Parameter::try_from_primitive(id) {
+			Ok(param) => {
+				//
+				match param.get_param_value_by_string(&string) {
+					Some(new_value) => {
+						*value = new_value;
+						kResultTrue
+					}
+					None => kResultFalse,
 				}
-				None => kResultFalse,
-			},
-			None => kInvalidArgument,
+			}
+			Err(err) => {
+				error!("get_param_value_by_string({}) {}", id, err);
+				kInvalidArgument
+			}
 		}
 	}
 
 	unsafe fn normalized_param_to_plain(&self, id: u32, value_normalized: f64) -> f64 {
-		if let Some(param) = self.nth_parameter(id as usize) {
-			param.normalized_param_to_plain(value_normalized)
-		} else {
-			value_normalized
+		match Parameter::try_from_primitive(id) {
+			Ok(param) => param.normalized_param_to_plain(value_normalized),
+			_ => value_normalized,
 		}
 	}
 
 	unsafe fn plain_param_to_normalized(&self, id: u32, plain_value: f64) -> f64 {
-		if let Some(param) = self.nth_parameter(id as usize) {
-			param.plain_param_to_normalized(plain_value)
-		} else {
-			plain_value
+		match Parameter::try_from_primitive(id) {
+			Ok(param) => param.plain_param_to_normalized(plain_value),
+			_ => plain_value,
 		}
 	}
 
 	unsafe fn get_param_normalized(&self, id: u32) -> f64 {
-		if let Some(param) = self.nth_parameter(id as usize) {
-			self.parameters.borrow()[param]
-		} else {
-			0.0
+		match Parameter::try_from_primitive(id) {
+			Ok(param) => {
+				//
+				match self.parameters.try_borrow() {
+					Ok(params) => params[param],
+					_ => 0.0,
+				}
+			}
+			_ => 0.0,
 		}
 	}
 
 	unsafe fn set_param_normalized(&self, id: u32, value: f64) -> tresult {
-		info!("set_param_normalized()");
-		if let Some(param) = self.nth_parameter(id as usize) {
-			self.parameters.borrow_mut()[param] = value;
-			kResultTrue
-		} else {
-			kResultFalse
+		match Parameter::try_from_primitive(id) {
+			Ok(param) => {
+				//
+				match self.parameters.try_borrow_mut() {
+					Ok(mut params) => {
+						params[param] = value;
+						kResultOk
+					}
+					Err(err) => {
+						error!("set_param_normalized({}) {}", id, err);
+						kInternalError
+					}
+				}
+			}
+			Err(err) => {
+				error!("set_param_normalized({}) {}", id, err);
+				kInvalidArgument
+			}
 		}
 	}
 
@@ -260,29 +274,17 @@ impl IPluginBase for OpusController {
 impl IUnitInfo for OpusController {
 	unsafe fn get_unit_count(&self) -> i32 {
 		info!("get_unit_count()");
-		2
+		Unit::VARIANT_COUNT.try_into().unwrap()
 	}
 
 	unsafe fn get_unit_info(&self, unit_index: i32, info: *mut UnitInfo) -> tresult {
-		(*info) = match unit_index {
-			0 => UnitInfo {
-				id: 1,
-				parent_unit_id: 0,
-				name: vst_str::str_16("Encoder"),
-				program_list_id: -1,
-			},
-			1 => UnitInfo {
-				id: 2,
-				parent_unit_id: 0,
-				name: vst_str::str_16("Decoder"),
-				program_list_id: -1,
-			},
-			_ => {
-				return kResultFalse;
+		match Unit::try_from_primitive(unit_index) {
+			Ok(unit) => {
+				(*info) = unit.get_info();
+				kResultOk
 			}
-		};
-
-		kResultTrue
+			_ => kInvalidArgument,
+		}
 	}
 
 	unsafe fn get_program_list_count(&self) -> i32 {

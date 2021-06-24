@@ -1,18 +1,24 @@
-use super::dsp;
+use super::dsp::upgrade_param_changes;
+use super::dsp::OpusDSP;
+use super::params::Parameter;
 use super::ContextPtr;
-use super::SaveState;
+use super::VstClassInfo;
+use crate::vst_result;
 use crate::vst_str;
-use crate::Component;
+use enum_map::EnumMap;
 use hex_literal::hex;
 use log::*;
 use std::cell::RefCell;
-use std::cell::RefMut;
 use std::mem::size_of;
 use std::ptr::null_mut;
 use std::slice;
 use vst3_com::{c_void, sys::GUID, ComPtr, IID};
 use vst3_sys::base::kInvalidArgument;
 use vst3_sys::base::ClassCardinality;
+use vst3_sys::base::{
+	kNotImplemented, kResultFalse, kResultOk, kResultTrue, tresult, IBStream, IPluginBase, TBool,
+};
+use vst3_sys::vst::kStereo;
 use vst3_sys::vst::BusDirections;
 use vst3_sys::vst::MediaTypes;
 use vst3_sys::vst::SpeakerArrangement;
@@ -21,25 +27,6 @@ use vst3_sys::vst::{
 	ProcessData, ProcessSetup, RoutingInfo, K_SAMPLE32, K_SAMPLE64,
 };
 use vst3_sys::VST3;
-use vst3_sys::{
-	base::{
-		kInternalError, kNotImplemented, kNotInitialized, kResultFalse, kResultOk, kResultTrue,
-		tresult, IBStream, IPluginBase, TBool,
-	},
-	vst::kStereo,
-};
-
-macro_rules! graceful {
-	($expr:expr) => {
-		match $expr {
-			Ok(x) => x,
-			Err(err) => {
-				error!("{}", err);
-				return kInternalError;
-			}
-		}
-	};
-}
 
 // TODO add repr(i32) to MediaTypes and BusDirections, maybe?
 const KAUDIO: MediaType = MediaTypes::kAudio as MediaType;
@@ -67,22 +54,23 @@ pub struct OpusProcessor {
 	audio_inputs: RefCell<AudioInputs>,
 	audio_outputs: RefCell<AudioOutputs>,
 	context: RefCell<ContextPtr>,
-	save_state: RefCell<SaveState>,
-	opus_dsp: RefCell<Option<Box<dsp::OpusDsp>>>,
-}
-
-impl Component for OpusProcessor {
-	const CID: GUID = GUID {
-		data: hex!("8eea3bf524c346238e5bbe445f88b05a"),
-	};
-	const CARDINALITY: i32 = ClassCardinality::kManyInstances as i32;
-	const CATEGORY: &'static str = "Audio Module Class";
-	const NAME: &'static str = "Opus Parvulum";
-	const CLASS_FLAGS: u32 = 1; // 1 distributable, 2 simple io supported
-	const SUBCATEGORIES: &'static str = "Fx";
+	opus_dsp: RefCell<OpusDSP>,
 }
 
 impl OpusProcessor {
+	pub const CID: IID = GUID {
+		data: hex!("998084b38bd70c0e0a2554078097576e"),
+	};
+
+	pub const INFO: VstClassInfo = VstClassInfo {
+		cid: Self::CID,
+		name: "Opus Parvulum",
+		category: "Audio Module Class",
+		subcategories: "Fx",
+		class_flags: 1, // 1 distributable, 2 simple io supported
+		cardinality: ClassCardinality::kManyInstances as i32,
+	};
+
 	pub fn new() -> Box<Self> {
 		let current_process_mode = RefCell::new(CurrentProcessorMode(0));
 		let process_setup = RefCell::new(ProcessSetupWrapper(ProcessSetup {
@@ -94,15 +82,13 @@ impl OpusProcessor {
 		let audio_inputs = RefCell::new(AudioInputs(vec![]));
 		let audio_outputs = RefCell::new(AudioOutputs(vec![]));
 		let context = RefCell::new(ContextPtr(null_mut()));
-		let save_state = RefCell::new(SaveState::new());
-		let opus_dsp = RefCell::new(None);
+		let opus_dsp = RefCell::new(OpusDSP::default());
 		Self::allocate(
 			current_process_mode,
 			process_setup,
 			audio_inputs,
 			audio_outputs,
 			context,
-			save_state,
 			opus_dsp,
 		)
 	}
@@ -149,7 +135,7 @@ fn get_channel_count(arr: SpeakerArrangement) -> i32 {
 impl IComponent for OpusProcessor {
 	unsafe fn get_controller_class_id(&self, tuid: *mut IID) -> tresult {
 		info!("get_controller_class_id()");
-		*tuid = super::controller::OpusController::CID;
+		*tuid = super::controller::OpusController::INFO.cid;
 		kResultOk
 	}
 
@@ -293,54 +279,54 @@ impl IComponent for OpusProcessor {
 			return kResultFalse;
 		}
 
+		let mut params = EnumMap::<Parameter, f64>::default();
+
 		let state = state as *mut *mut _;
 		let state: ComPtr<dyn IBStream> = ComPtr::new(state);
-
-		let mut save_state = self.save_state.borrow_mut();
-
 		let mut num_bytes_read = 0;
-		let saved_params_ptr = &mut *save_state as *mut SaveState as *mut c_void;
-		state.read(
-			saved_params_ptr,
-			size_of::<SaveState>() as i32,
-			&mut num_bytes_read,
-		);
 
-		info!("set_state() => kResultOk, {:?}", save_state);
+		for (_, val) in params.iter_mut() {
+			let ptr = val as *mut f64 as *mut c_void;
+			state.read(ptr, size_of::<f64>() as i32, &mut num_bytes_read);
+		}
+
+		// Values read from saved state, into the DSP
+
+		let mut dsp = vst_result!(self.opus_dsp.try_borrow_mut());
+
+		for (param, value) in params.iter() {
+			vst_result!(param.set_to_dsp(&mut dsp, *value));
+		}
+
+		info!("set_state() => kResultOk, read {:?} f64", params.len());
 		kResultOk
 	}
 
 	unsafe fn get_state(&self, state: *mut c_void) -> tresult {
-		info!("get_state()");
-
 		if state.is_null() {
+			info!("get_state() => kResultFalse");
 			return kResultFalse;
 		}
 
+		let dsp = vst_result!(self.opus_dsp.try_borrow_mut());
+		let mut params = EnumMap::<Parameter, f64>::default();
+
+		for (param, value) in params.iter_mut() {
+			*value = vst_result!(param.get_from_dsp(&dsp));
+		}
+
+		// Values from the DSP, write into saved state
+
 		let state = state as *mut *mut _;
 		let state: ComPtr<dyn IBStream> = ComPtr::new(state);
-
-		let dsp = self.opus_dsp.borrow();
-		let save_state = match &*dsp {
-			Some(dsp) => SaveState {
-				bypass: dsp.bypass,
-				complexity: dsp.encoder.complexity().unwrap(),
-				inband_fec: dsp.encoder.inband_fec().unwrap(),
-				packet_loss_perc: dsp.encoder.packet_loss_perc().unwrap(),
-				max_bandwidth: dsp.encoder.max_bandwidth().unwrap(),
-				gain: dsp.decoder.gain().unwrap(),
-			},
-			None => SaveState::new(),
-		};
-
 		let mut num_bytes_written = 0;
-		let saved_params_ptr = &save_state as *const SaveState as *const c_void;
-		state.write(
-			saved_params_ptr,
-			size_of::<SaveState>() as i32,
-			&mut num_bytes_written,
-		);
 
+		for (_param, val) in params.iter() {
+			let ptr = val as *const f64 as *const c_void;
+			state.write(ptr, size_of::<f64>() as i32, &mut num_bytes_written);
+		}
+
+		info!("set_state() => kResultOk, wrote {:?} f64", params.len());
 		kResultOk
 	}
 }
@@ -433,19 +419,10 @@ impl IAudioProcessor for OpusProcessor {
 	}
 
 	unsafe fn get_latency_samples(&self) -> u32 {
-		let dsp_ref = self.opus_dsp.borrow();
-
-		match &*dsp_ref {
-			Some(dsp) => {
-				let frames = dsp.latency();
-				info!("get_latency_samples() => {}", frames);
-				frames as u32
-			}
-			None => {
-				info!("get_latency_samples() => 0: not ready");
-				0
-			}
-		}
+		let dsp = self.opus_dsp.borrow();
+		let frames = dsp.latency();
+		info!("get_latency_samples() => {}", frames);
+		frames as u32
 	}
 
 	unsafe fn setup_processing(&self, setup: *const ProcessSetup) -> tresult {
@@ -473,16 +450,9 @@ impl IAudioProcessor for OpusProcessor {
 			}
 		}
 
-		let dsp = match dsp::OpusDsp::new(setup) {
-			Ok(dsp) => Some(Box::new(dsp)),
-			Err(err) => {
-				error!("setup_processing() => {}: {}", kInternalError, err);
-				return kInternalError;
-			}
-		};
+		let mut dsp = vst_result!(self.opus_dsp.try_borrow_mut());
 
-		// Save
-		*self.opus_dsp.borrow_mut() = dsp;
+		vst_result!(dsp.setup(setup));
 
 		self.process_setup.borrow_mut().0 = *setup;
 
@@ -502,20 +472,8 @@ impl IAudioProcessor for OpusProcessor {
 		info!("set_processing({})", state);
 
 		if state == 0 {
-			let mut dsp = {
-				let dsp_ref = graceful!(self.opus_dsp.try_borrow_mut());
-
-				match *dsp_ref {
-					Some(_) => RefMut::map(dsp_ref, |x| x.as_mut().unwrap().as_mut()),
-
-					None => {
-						error!("setup_processing() must be called first");
-						return kNotInitialized;
-					}
-				}
-			};
-
-			graceful!(dsp.reset());
+			let mut dsp = vst_result!(self.opus_dsp.try_borrow_mut());
+			dsp.reset();
 		}
 
 		kResultTrue
@@ -526,19 +484,7 @@ impl IAudioProcessor for OpusProcessor {
 		// Convert pointer to reference for borrow checking
 		let data = &mut *data;
 
-		// Verify that setup_processing() has not been called first, and unpack
-		let mut dsp = {
-			let dsp_ref = graceful!(self.opus_dsp.try_borrow_mut());
-
-			match *dsp_ref {
-				Some(_) => RefMut::map(dsp_ref, |x| x.as_mut().unwrap().as_mut()),
-
-				None => {
-					error!("setup_processing() must be called first");
-					return kNotInitialized;
-				}
-			}
-		};
+		let mut dsp = vst_result!(self.opus_dsp.try_borrow_mut());
 
 		// TODO: Are these MIDI events???
 		if let Some(input_events) = data.input_events.upgrade() {
@@ -549,27 +495,15 @@ impl IAudioProcessor for OpusProcessor {
 		}
 
 		// Convert parameter queues to map type
-		let input_params = dsp::upgrade_param_changes(&data.input_param_changes);
+		let input_params = upgrade_param_changes(&data.input_param_changes);
 
 		// Apply parameters and return when there are no buses
 		if data.num_inputs == 0 && data.num_outputs == 0 {
-			graceful!(dsp.apply_parameter_changes(&input_params, usize::MAX));
+			vst_result!(dsp.apply_parameter_changes(&input_params, usize::MAX));
 			return kResultOk;
 		}
 
-		// Expect stereo in and stereo out
-		let (in_bus, mut out_bus) = match dsp::try_stereo_buses(data) {
-			Some(tuple) => tuple,
-			None => {
-				error!("process() stereo input and output buses are expected");
-				error!("input buses: {}", data.num_inputs);
-				error!("output buses: {}", data.num_outputs);
-				return kInvalidArgument;
-			}
-		};
-
-		// Perform frame-wise calculation of output and write to buffers
-		graceful!(dsp.process(&in_bus, &mut out_bus, &input_params));
+		vst_result!(dsp.process(data));
 
 		kResultOk
 	}
