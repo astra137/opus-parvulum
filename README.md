@@ -2,11 +2,9 @@
 
 Lossy [Opus](https://opus-codec.org/) as a real-time audio effect plugin.
 
-## WIP
+## Archived
 
-This Rust project is a work-in-progress, but I intend to release a downloadable binary soon.
-
-During development, I am testing the plugin with Ableton 11 on Windows.
+This Rust project was a work-in-progress and never released as a download. During development, I tested the plugin with Ableton 11 on Windows.
 
 ## Credits
 
